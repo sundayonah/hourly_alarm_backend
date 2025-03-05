@@ -18,4 +18,6 @@ func Routes() {
 	http.Handle("/api/status", corsMiddleware(http.HandlerFunc(utils.GetStatus)))
 	http.Handle("/api/interval", corsMiddleware(http.HandlerFunc(utils.UpdateInterval)))
 	http.Handle("/api/events", corsMiddleware(http.HandlerFunc(utils.AlarmEvents)))
+	http.Handle("/api/pause", corsMiddleware(http.HandlerFunc(utils.PauseAlarm)))
+	http.Handle("/api/resume", corsMiddleware(http.HandlerFunc(utils.ResumeAlarm)))
 }
