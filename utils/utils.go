@@ -216,21 +216,37 @@ func GetStatus(w http.ResponseWriter, r *http.Request) {
 // Method for updating interval
 func UpdateInterval(w http.ResponseWriter, r *http.Request) {
 	var requestData struct {
-		Interval int64 `json:"interval"`
+		Interval  *int64 `json:"interval,omitempty"`  // Optional field
+		BreakTime *int64 `json:"breakTime,omitempty"` // Optional field
 	}
+
 	if err := json.NewDecoder(r.Body).Decode(&requestData); err != nil {
 		http.Error(w, "Invalid request format", http.StatusBadRequest)
-		return
-	}
-	if requestData.Interval < 1 || requestData.Interval > 1440 {
-		http.Error(w, "Interval must be between 1 and 1440 minutes", http.StatusBadRequest)
 		return
 	}
 
 	statusMutex.Lock()
 	defer statusMutex.Unlock()
 
-	status.Interval = requestData.Interval
+	// Update interval if provided
+	if requestData.Interval != nil {
+		if *requestData.Interval < 1 || *requestData.Interval > 1440 {
+			http.Error(w, "Interval must be between 1 and 1440 minutes", http.StatusBadRequest)
+			return
+		}
+		status.Interval = *requestData.Interval
+	}
+
+	// Update breakTime if provided
+	if requestData.BreakTime != nil {
+		if *requestData.BreakTime < 1 || *requestData.BreakTime > 1440 {
+			http.Error(w, "Break time must be between 1 and 1440 minutes", http.StatusBadRequest)
+			return
+		}
+		status.BreakTime = *requestData.BreakTime
+	}
+
+	// If the alarm is running, restart it with new settings
 	if status.Running {
 		stopChan <- true
 		status.Running = true
@@ -239,7 +255,11 @@ func UpdateInterval(w http.ResponseWriter, r *http.Request) {
 		status.WorkStatus = types.Working
 		go RunAlarm()
 	}
-	log.Printf("Interval updated to %d minutes at: %s", requestData.Interval, formatTimeReadable(time.Now()))
+
+	log.Printf("Settings updated - Interval: %d minutes, Break: %d minutes at: %s",
+		status.Interval,
+		status.BreakTime,
+		formatTimeReadable(time.Now()))
 	json.NewEncoder(w).Encode(status)
 }
 
