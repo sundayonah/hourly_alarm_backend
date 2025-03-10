@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"sync"
 	"time"
@@ -24,31 +25,39 @@ var (
 func init() {
 	status = types.AlarmStatus{
 		Running:    false,
-		Interval:   1,             // 1 hour work interval
-		BreakTime:  1,             // 5-minute break
-		WorkStatus: types.Working, // Initial status is working
+		Interval:   2,             // 5-minute work interval
+		BreakTime:  1,             // 1-minute break with alarm
+		WorkStatus: types.Stopped, // Initial status is stopped
 	}
 	alarmChan = make(chan bool)
 	stopChan = make(chan bool)
 	pauseChan = make(chan bool)
 	resumeChan = make(chan bool)
 }
+
 func formatTimeReadable(t time.Time) string {
 	return t.Format("Mon Jan 2 2006 at 3:04:05 PM")
 }
 
-// Calculate remaining time based on current state
 func RunAlarm() {
 	go func() {
 		var pauseStart time.Time
 		var remainingTime time.Duration
 		var currentTimerStart time.Time
 
-		// Initialize the timer when the alarm starts
-		currentTimerStart = time.Now()
-		alarmTimer = time.NewTimer(time.Duration(status.Interval) * time.Minute)
-
 		for {
+			statusMutex.Lock()
+			if !status.Running {
+				statusMutex.Unlock()
+				return
+			}
+			// Start work period
+			currentTimerStart = time.Now()
+			alarmTimer = time.NewTimer(time.Duration(status.Interval) * time.Minute)
+			status.WorkStatus = types.Working
+			status.NextAlarm = currentTimerStart.Add(time.Duration(status.Interval) * time.Minute)
+			statusMutex.Unlock()
+
 			select {
 			case <-stopChan:
 				statusMutex.Lock()
@@ -64,8 +73,6 @@ func RunAlarm() {
 				statusMutex.Lock()
 				pauseStart = time.Now()
 				status.WorkStatus = types.Paused
-
-				// Calculate remaining time
 				if alarmTimer != nil {
 					alarmTimer.Stop()
 					remainingTime = time.Duration(status.Interval)*time.Minute - time.Since(currentTimerStart)
@@ -76,71 +83,50 @@ func RunAlarm() {
 				statusMutex.Lock()
 				if status.WorkStatus == types.Paused {
 					pauseDuration := time.Since(pauseStart)
-
-					// Adjust remaining time by subtracting pause duration
 					if remainingTime > pauseDuration {
 						remainingTime -= pauseDuration
 					} else {
 						remainingTime = 0
 					}
-
-					// Restart timer with remaining time
 					currentTimerStart = time.Now()
 					alarmTimer = time.NewTimer(remainingTime)
 					status.WorkStatus = types.Working
+					status.NextAlarm = currentTimerStart.Add(remainingTime)
 				}
 				statusMutex.Unlock()
 
 			case <-alarmTimer.C:
 				statusMutex.Lock()
 				now := time.Now()
+				status.LastAlarm = now
+				status.NextAlarm = now.Add(time.Duration(status.BreakTime) * time.Minute)
+				status.WorkStatus = types.OnBreak
+				breakEnd := now.Add(time.Duration(status.BreakTime) * time.Minute)
+				statusMutex.Unlock()
 
-				if status.WorkStatus == types.Working {
-					// Work interval completed, start break
-					status.LastAlarm = now
-					status.NextAlarm = now.Add(time.Duration(status.BreakTime) * time.Minute)
-					status.WorkStatus = types.OnBreak
-
-					// Trigger break alarm for specified duration
-					breakEnd := now.Add(time.Duration(status.BreakTime) * time.Minute)
-
-					statusMutex.Unlock()
-
-					for time.Now().Before(breakEnd) {
-						alarmChan <- true
-						time.Sleep(1 * time.Second)
-					}
-
-					// Return to working state
-					statusMutex.Lock()
-					status.WorkStatus = types.Working
-
-					// Reset timer for next work interval
-					currentTimerStart = time.Now()
-					alarmTimer = time.NewTimer(time.Duration(status.Interval) * time.Minute)
-					statusMutex.Unlock()
-
-					log.Printf("Break time over. Return to work! Current time: %s", formatTimeReadable(now))
-					log.Printf("Next alarm scheduled for: %s", formatTimeReadable(status.NextAlarm))
-				} else if status.WorkStatus == types.OnBreak {
-					// Break completed, return to work
-					status.WorkStatus = types.Working
-
-					// Reset timer for work interval
-					currentTimerStart = time.Now()
-					alarmTimer = time.NewTimer(time.Duration(status.Interval) * time.Minute)
-					statusMutex.Unlock()
-
-					log.Printf("Break time over. Return to work! Current time: %s", formatTimeReadable(now))
-				} else {
-					statusMutex.Unlock()
+				// Trigger alarm for 1 minute
+				for time.Now().Before(breakEnd) {
+					alarmChan <- true
+					time.Sleep(250 * time.Millisecond) // Send alarm signal 4 times per second
 				}
+
+				// Transition back to work
+				statusMutex.Lock()
+				now = time.Now()
+				status.WorkStatus = types.Working
+				currentTimerStart = now
+				status.NextAlarm = now.Add(time.Duration(status.Interval) * time.Minute)
+				alarmTimer = time.NewTimer(time.Duration(status.Interval) * time.Minute)
+				statusMutex.Unlock()
+
+				log.Printf("Break ended. Back to work! Current time: %s", formatTimeReadable(now))
+				log.Printf("Next alarm scheduled for: %s", formatTimeReadable(status.NextAlarm))
 			}
 		}
 	}()
 }
 
-// Method for reset alarm
+// Method for starting alarm
 func StartAlarm(w http.ResponseWriter, r *http.Request) {
 	statusMutex.Lock()
 	defer statusMutex.Unlock()
@@ -150,17 +136,14 @@ func StartAlarm(w http.ResponseWriter, r *http.Request) {
 		status.WorkStatus = types.Working
 		now := time.Now()
 		status.NextAlarm = now.Add(time.Duration(status.Interval) * time.Minute)
-
 		go RunAlarm()
-
 		log.Printf("Alarm started at: %s", formatTimeReadable(now))
 		log.Printf("Next alarm scheduled for: %s", formatTimeReadable(status.NextAlarm))
 	}
-
 	json.NewEncoder(w).Encode(status)
 }
 
-// Method for stop alarm
+// Method for stopping alarm
 func StopAlarm(w http.ResponseWriter, r *http.Request) {
 	statusMutex.Lock()
 	defer statusMutex.Unlock()
@@ -171,11 +154,10 @@ func StopAlarm(w http.ResponseWriter, r *http.Request) {
 		status.WorkStatus = types.Stopped
 		log.Printf("Alarm stopped at: %s", formatTimeReadable(time.Now()))
 	}
-
 	json.NewEncoder(w).Encode(status)
 }
 
-// Method for pause
+// Method for pausing alarm
 func PauseAlarm(w http.ResponseWriter, r *http.Request) {
 	statusMutex.Lock()
 	defer statusMutex.Unlock()
@@ -184,11 +166,10 @@ func PauseAlarm(w http.ResponseWriter, r *http.Request) {
 		pauseChan <- true
 		log.Printf("Alarm paused at: %s", formatTimeReadable(time.Now()))
 	}
-
 	json.NewEncoder(w).Encode(status)
 }
 
-// Method for resume alarm
+// Method for resuming alarm
 func ResumeAlarm(w http.ResponseWriter, r *http.Request) {
 	statusMutex.Lock()
 	defer statusMutex.Unlock()
@@ -197,92 +178,78 @@ func ResumeAlarm(w http.ResponseWriter, r *http.Request) {
 		resumeChan <- true
 		log.Printf("Alarm resumed at: %s", formatTimeReadable(time.Now()))
 	}
-
 	json.NewEncoder(w).Encode(status)
 }
 
-// Method for reset alarm
+// Method for resetting alarm
 func ResetAlarm(w http.ResponseWriter, r *http.Request) {
 	statusMutex.Lock()
 	defer statusMutex.Unlock()
 
-	// If running, stop it first
 	if status.Running {
 		stopChan <- true
-		status.Running = false
 	}
-
-	// Then start it again
 	status.Running = true
 	now := time.Now()
 	status.NextAlarm = now.Add(time.Duration(status.Interval) * time.Minute)
-
-	// Start the alarm goroutine
+	status.WorkStatus = types.Working
 	go RunAlarm()
-
 	log.Printf("Alarm reset at: %s", formatTimeReadable(now))
 	log.Printf("Next alarm scheduled for: %s", formatTimeReadable(status.NextAlarm))
 	json.NewEncoder(w).Encode(status)
 }
 
-// Method for getting current alarm status and time information
+// Method for getting current alarm status
 func GetStatus(w http.ResponseWriter, r *http.Request) {
 	statusMutex.Lock()
 	defer statusMutex.Unlock()
 
+	if status.Running && status.WorkStatus != types.Paused {
+		remaining := time.Until(status.NextAlarm)
+		status.RemainingTime = int64(math.Round(remaining.Seconds())) // Use seconds for finer granularity
+	} else {
+		status.RemainingTime = 0
+	}
 	json.NewEncoder(w).Encode(status)
 }
 
-// Method for updating the break time
+// Method for updating interval
 func UpdateInterval(w http.ResponseWriter, r *http.Request) {
 	var requestData struct {
 		Interval int64 `json:"interval"`
 	}
-
-	err := json.NewDecoder(r.Body).Decode(&requestData)
-	if err != nil {
+	if err := json.NewDecoder(r.Body).Decode(&requestData); err != nil {
 		http.Error(w, "Invalid request format", http.StatusBadRequest)
 		return
 	}
-
-	if requestData.Interval < 1 {
-		http.Error(w, "Interval must be at least 1 minute", http.StatusBadRequest)
+	if requestData.Interval < 1 || requestData.Interval > 1440 {
+		http.Error(w, "Interval must be between 1 and 1440 minutes", http.StatusBadRequest)
 		return
 	}
 
 	statusMutex.Lock()
 	defer statusMutex.Unlock()
 
-	// Update the interval
 	status.Interval = requestData.Interval
-
-	// If running, reset the timer
 	if status.Running {
 		stopChan <- true
 		status.Running = true
 		now := time.Now()
 		status.NextAlarm = now.Add(time.Duration(status.Interval) * time.Minute)
+		status.WorkStatus = types.Working
 		go RunAlarm()
 	}
-
 	log.Printf("Interval updated to %d minutes at: %s", requestData.Interval, formatTimeReadable(time.Now()))
-	if status.Running {
-		log.Printf("Next alarm scheduled for: %s", formatTimeReadable(status.NextAlarm))
-	}
-
 	json.NewEncoder(w).Encode(status)
 }
 
 // SSE endpoint for real-time alarm notifications
 func AlarmEvents(w http.ResponseWriter, r *http.Request) {
-	// Set headers for SSE
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
-	// Create a channel for client disconnection
 	clientGone := r.Context().Done()
-
 	for {
 		select {
 		case <-clientGone:
